@@ -10,6 +10,7 @@
     Stop         at the sweep high, or above the inversion / breaker zone
     Target       1:2 risk-to-reward
     Timing       signal candle must overlap an ICT macro window (New York time)
+    Today only   a new trading day clears any leg, context and unfilled signal
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from .model import Candle, Dir, Event, Kind, SetupConfig, Trade
-from .timeframes import in_macro, parse_macros
+from .timeframes import bucket_key, in_macro, parse_macros
 
 ContextFn = Callable[[int, Candle], bool]
 
@@ -42,6 +43,7 @@ class SetupModel:
         self.legs: Dict[int, Optional[_Leg]] = {-1: None, 1: None}
         self.trades: List[Trade] = []
         self._pending: List[Trade] = []
+        self._day = None
 
     # ------------------------------------------------------------------
     def macro_ok(self, c: Candle) -> bool:
@@ -61,6 +63,16 @@ class SetupModel:
         Returns trades that were *signalled* on this bar (filled next bar).
         """
         cfg = self.cfg
+        if cfg.daily_reset:
+            day = bucket_key(c.t, "D", cfg.macro_tz, cfg.session_start_min)
+            if self._day is not None and day != self._day:
+                # today-only setups: nothing carries over from the previous trading day
+                self.legs = {-1: None, 1: None}
+                self.ctx_i = {-1: None, 1: None}
+                for tr in self._pending:
+                    tr.outcome = "cancelled"
+                self._pending = []
+            self._day = day
         self._fill_and_manage(i, c)
 
         new: List[Trade] = []

@@ -49,8 +49,21 @@ closest to equilibrium.
 - Inversion FVGs share the FVG row and are marked `i`.
 
 **Sequence**: when price delivers upward, it meets the live arrays above it in price
-order. "Next ▲" and "Next ▼" in each column give the nearest live array entirely above
-or below the current price. That array is the next draw on that timeframe.
+order, and the nearest one is the next draw.
+
+**What is drawn** [Impl]:
+
+- **HTF key levels.** Of the live higher-timeframe arrays, only the `perSide` (default 2)
+  closest to price on each side are drawn.
+  - An array whose mean threshold is at or above price counts as *above*. Its distance
+    is how far its bottom is above price, or 0 when price is inside it.
+  - Below works the same way.
+  - Ties go to the higher timeframe.
+  - Selection runs across all higher timeframes by default, or per timeframe.
+- **Chart timeframe.** Only arrays formed in the current trading day are drawn and
+  shown in the matrix column. This filter is off on daily and higher charts.
+- Every array on every timeframe is still tracked through its full lifecycle. These
+  rules only decide what is displayed.
 
 ## 3. PD array definitions
 
@@ -160,3 +173,9 @@ Bookkeeping [Impl]:
   beyond the stop.
 - If the stop and the target print in the same candle, the stop is counted first
   (conservative).
+- **Today only.** A new trading day clears any in-progress leg, the HTF context, and
+  unfilled signals, so no setup carries across days.
+  - The indicator follows the symbol's own session, for example 18:00 New York for CME
+    futures. The Python engine uses `SetupConfig.session_start_min` for the same thing.
+  - The indicator also clears the day's trades from the chart and resets the tally. The
+    Python backtester keeps resolving trades that are already open.

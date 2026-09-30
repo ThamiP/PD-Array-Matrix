@@ -118,3 +118,15 @@ def test_same_candle_inversion_and_breaker_are_order_independent():
                          Event("converted", "5", 1, arr(5, Kind.FVG), child=ifvg)])
     assert [(t.kind, t.zone_id) for t in model.trades] == [("IFVG", 3), ("Breaker", 2)]
     assert all(t.stop == 12.0 for t in model.trades)
+
+
+def test_setups_are_today_only():
+    # sweep at 23:50, inversion at 00:05: the leg does not survive the new trading day
+    late = ny_ms(2026, 9, 28, 23, 25)
+    _, model = run(SHORT_PATH, SetupConfig(require_macro=False), start=late)
+    assert model.trades == []
+    _, model = run(SHORT_PATH, SetupConfig(require_macro=False, daily_reset=False), start=late)
+    assert [t.kind for t in model.trades] == ["IFVG", "Breaker"]
+    # an 18:00 session start keeps 23:25-00:20 inside one trading day
+    _, model = run(SHORT_PATH, SetupConfig(require_macro=False, session_start_min=18 * 60), start=late)
+    assert [t.kind for t in model.trades] == ["IFVG", "Breaker"]

@@ -225,6 +225,8 @@ class SetupConfig:
     macro_tz: str = "America/New_York"
     sweep_mode: str = "any"  # "any" (swept or run) or "wick" (swept only)
     mb_as_breaker: bool = False
+    daily_reset: bool = True  # setups are today-only: a new trading day clears legs, context, pending
+    session_start_min: int = 0  # trading-day start in macro_tz minutes (18*60 for CME futures)
 
 
 @dataclass
