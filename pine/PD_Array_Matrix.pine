@@ -1,0 +1,994 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+//
+// ICT PD Array Matrix — multi-timeframe lifecycle engine + "One Setup for Life" model
+//
+//   Premium (range high -> EQ)          Discount (EQ -> range low)
+//     1 Liquidity Pool                    1 Mitigation Block
+//     2 Rejection Block                   2 Breaker Block
+//     3 Order Block                       3 Volume Imbalance
+//     4 Fair Value Gap                    4 Fair Value Gap
+//     5 Volume Imbalance                  5 Order Block
+//     6 Breaker Block                     6 Rejection Block
+//     7 Mitigation Block                  7 Liquidity Pool
+//
+// Every PD array on every timeframe runs the same lifecycle, evaluated on that timeframe's candle close:
+//   Fresh -> Tested -> (Filled) -> Invalidated -> successor (FVG -> iFVG, OB -> Breaker / Mitigation Block)
+//   Liquidity pools: Fresh -> Swept (wick through, close back) | Run (close through)
+//   Anything live too long / beyond capacity -> Expired
+//
+// Rules: docs/RULES.md. Executable reference + tests: pdmatrix/ (Python).
+indicator("ICT PD Array Matrix [MTF Lifecycle]", shorttitle = "PD Matrix", overlay = true, max_boxes_count = 500, max_lines_count = 100, max_labels_count = 100)
+
+// ═══════════════════════════════════════════════════════════════════ constants
+const int K_LP  = 0
+const int K_RB  = 1
+const int K_OB  = 2
+const int K_FVG = 3
+const int K_VI  = 4
+const int K_BB  = 5
+const int K_MB  = 6
+
+const int S_FRESH   = 0
+const int S_TESTED  = 1
+const int S_FILLED  = 2
+const int S_SWEPT   = 3
+const int S_RUN     = 4
+const int S_INVALID = 5
+const int S_EXPIRED = 6
+
+const int T_NONE    = 0
+const int T_TESTED  = 1
+const int T_FILLED  = 2
+const int T_SWEPT   = 3
+const int T_RUN     = 4
+const int T_INVALID = 5
+const int T_EXPIRED = 6
+
+const int    MAXC  = 64   // candles kept per timeframe
+const int    MAXSW = 20   // swings kept per side per timeframe
+const string NY    = "America/New_York"
+
+// ═══════════════════════════════════════════════════════════════════ inputs
+const string G_TF  = "Timeframes (column · draw)"
+bool   colChart = input.bool(true, "Chart TF", inline = "c0", group = G_TF)
+bool   drChart  = input.bool(true, "Draw", inline = "c0", group = G_TF)
+string tf1 = input.timeframe("15", "TF 1", inline = "t1", group = G_TF)
+bool   on1 = input.bool(true, "", inline = "t1", group = G_TF)
+bool   dr1 = input.bool(true, "Draw", inline = "t1", group = G_TF)
+string tf2 = input.timeframe("60", "TF 2", inline = "t2", group = G_TF)
+bool   on2 = input.bool(true, "", inline = "t2", group = G_TF)
+bool   dr2 = input.bool(true, "Draw", inline = "t2", group = G_TF)
+string tf3 = input.timeframe("240", "TF 3", inline = "t3", group = G_TF)
+bool   on3 = input.bool(true, "", inline = "t3", group = G_TF)
+bool   dr3 = input.bool(true, "Draw", inline = "t3", group = G_TF)
+string tf4 = input.timeframe("D", "TF 4", inline = "t4", group = G_TF)
+bool   on4 = input.bool(true, "", inline = "t4", group = G_TF)
+bool   dr4 = input.bool(true, "Draw", inline = "t4", group = G_TF)
+string tf5 = input.timeframe("W", "TF 5", inline = "t5", group = G_TF, tooltip = "Timeframes at or below the chart timeframe are skipped. Higher timeframes are built from chart bars, so their depth depends on the chart history loaded.")
+bool   on5 = input.bool(true, "", inline = "t5", group = G_TF)
+bool   dr5 = input.bool(true, "Draw", inline = "t5", group = G_TF)
+
+const string G_DET = "Detection"
+int    swingLen  = input.int(2, "Swing length (bars each side)", minval = 1, maxval = 10, group = G_DET)
+int    atrLen    = input.int(14, "ATR length", minval = 1, group = G_DET)
+float  eqTolAtr  = input.float(0.10, "Equal highs/lows tolerance (x ATR)", minval = 0, step = 0.05, group = G_DET, tooltip = "Swing highs/lows within this distance merge into one liquidity pool (touches++).")
+float  rbWickPct = input.float(0.50, "Rejection block min wick (fraction of range)", minval = 0.1, maxval = 1, step = 0.05, group = G_DET)
+float  fvgMinAtr = input.float(0.10, "FVG min size (x ATR)", minval = 0, step = 0.05, group = G_DET)
+float  viMinAtr  = input.float(0.00, "Volume imbalance min size (x ATR)", minval = 0, step = 0.05, group = G_DET)
+bool   viOverlap = input.bool(true, "Volume imbalance requires overlapping wicks", group = G_DET)
+float  dispAtr   = input.float(1.00, "Displacement body (x ATR)", minval = 0, step = 0.1, group = G_DET, tooltip = "A bullish/bearish FVG whose middle candle body is at least this big also triggers an order block.")
+int    obLookback = input.int(10, "Order block lookback (candles)", minval = 1, maxval = 30, group = G_DET)
+string obZone    = input.string("Wick", "Order block zone", options = ["Wick", "Body"], group = G_DET)
+
+const string G_LC = "Lifecycle"
+int    maxAge   = input.int(200, "Expire after (TF candles)", minval = 5, group = G_LC)
+int    maxLive  = input.int(30, "Max live arrays per TF", minval = 5, maxval = 60, group = G_LC)
+int    keepDead = input.int(6, "Keep ended arrays per TF", minval = 0, maxval = 20, group = G_LC)
+
+const string G_DR = "Chart drawing"
+bool   drawOn    = input.bool(true, "Draw PD arrays", group = G_DR)
+bool   showEnded = input.bool(true, "Show ended arrays (faded)", group = G_DR)
+bool   showLP  = input.bool(true, "LP", inline = "k", group = G_DR)
+bool   showRB  = input.bool(true, "RB", inline = "k", group = G_DR)
+bool   showOB  = input.bool(true, "OB", inline = "k", group = G_DR)
+bool   showFVG = input.bool(true, "FVG", inline = "k", group = G_DR)
+bool   showVI  = input.bool(true, "VI", inline = "k", group = G_DR)
+bool   showBB  = input.bool(true, "BB", inline = "k", group = G_DR)
+bool   showMB  = input.bool(true, "MB", inline = "k", group = G_DR)
+color  bullCol = input.color(#089981, "Bullish / discount", inline = "c1", group = G_DR)
+color  bearCol = input.color(#f23645, "Bearish / premium", inline = "c1", group = G_DR)
+color  brkCol  = input.color(#ff9800, "Breaker / mitigation", inline = "c2", group = G_DR)
+color  lpCol   = input.color(#787b86, "Liquidity", inline = "c2", group = G_DR)
+int    extendBars = input.int(12, "Extend live arrays (bars)", minval = 0, group = G_DR)
+string boxTxt  = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], group = G_DR)
+string rangeSel = input.string("TF 1", "Premium / discount shading", options = ["Off", "Chart", "TF 1", "TF 2", "TF 3", "TF 4", "TF 5"], group = G_DR)
+
+const string G_TB = "Matrix table"
+bool   tblOn   = input.bool(true, "Show PD Array Matrix", group = G_TB)
+string tblPos  = input.string("Top Right", "Position", options = ["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], group = G_TB)
+string tblTxt  = input.string("Tiny", "Text size", options = ["Tiny", "Small", "Normal"], group = G_TB)
+bool   pnlOn   = input.bool(true, "Show setup & lifecycle log", group = G_TB)
+string pnlPos  = input.string("Bottom Right", "Log position", options = ["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], group = G_TB)
+int    logLen  = input.int(8, "Log lines", minval = 0, maxval = 20, group = G_TB)
+bool   logChart = input.bool(false, "Log chart-TF events", group = G_TB)
+
+const string G_SU = "One Setup for Life (chart TF = execution TF)"
+bool   setupOn    = input.bool(true, "Enable model", group = G_SU)
+int    ctxWindow  = input.int(30, "Context valid after HTF PD array touch (bars)", minval = 1, group = G_SU)
+int    setupBars  = input.int(40, "Setup expires after sweep (bars)", minval = 1, group = G_SU)
+string sweepMode  = input.string("Any", "Liquidity sweep", options = ["Any", "Wick only"], group = G_SU, tooltip = "Any: a pool that is swept or run counts. Wick only: price must close back inside the level.")
+string stopMode   = input.string("Sweep extreme", "Stop placement", options = ["Sweep extreme", "Beyond zone"], group = G_SU, tooltip = "At the high (low) of the sweep, or above (below) the inversion / breaker zone.")
+float  stopTicks  = input.float(0, "Stop buffer (ticks)", minval = 0, group = G_SU)
+float  rr         = input.float(2.0, "Target risk : reward", minval = 0.25, step = 0.25, group = G_SU)
+bool   mbAsBrk    = input.bool(false, "Accept mitigation block as entry 2", group = G_SU)
+bool   reqMacro   = input.bool(true, "Require ICT macro window", group = G_SU)
+string macroSpec  = input.string("0750-0810,0850-0910,0950-1010,1050-1110,1150-1210,1320-1340,1450-1510,1515-1545,1550-1610", "Macro windows (New York, HHMM-HHMM)", group = G_SU)
+bool   shadeMacro = input.bool(true, "Shade macro windows (<= 15m charts)", group = G_SU)
+color  macroCol   = input.color(#2962ff, "Macro shade", group = G_SU)
+int    maxTrades  = input.int(20, "Trades kept on chart", minval = 1, maxval = 40, group = G_SU)
+
+const string G_AL = "Alerts (create one alert: Any alert() function call)"
+bool   alSetup  = input.bool(true, "Setup entries", group = G_AL)
+bool   alConv   = input.bool(true, "Inversions / breaker & mitigation conversions", group = G_AL)
+bool   alSweep  = input.bool(false, "Liquidity sweeps & runs", group = G_AL)
+bool   alFormed = input.bool(false, "New PD arrays", group = G_AL)
+bool   alChart  = input.bool(false, "Include chart-TF lifecycle events", group = G_AL)
+
+// ═══════════════════════════════════════════════════════════════════ types
+type Candle
+    int   t
+    int   tc
+    float o
+    float h
+    float l
+    float c
+
+type PDArray
+    int   id
+    int   kind
+    int   dir               // 1 bullish (discount / support), -1 bearish (premium / resistance)
+    float top
+    float bottom
+    float mid               // mean threshold (OB body 50%) / consequent encroachment
+    int   iOrigin
+    int   tOrigin
+    int   iFormed
+    int   state     = 0
+    int   taps      = 0
+    bool  ce        = false
+    bool  inverted  = false
+    bool  wasInside = false
+    int   touches   = 1
+    float liqRef
+    float extreme
+    bool  tookLiq   = false
+    int   parentId  = -1
+    int   iEnd
+    int   tEnd
+    box   bx
+
+type Swing
+    int   i
+    int   t
+    float p
+    bool  broken = false
+
+type Engine
+    string tf
+    string name
+    int    secs
+    int    slot
+    bool   valid
+    bool   column
+    bool   draw
+    array<Candle>  candles
+    array<PDArray> arrays
+    array<Swing>   highs
+    array<Swing>   lows
+    int    n          = 0
+    float  atr
+    Swing  lastHigh
+    Swing  lastLow
+    float  trailHigh
+    float  trailLow
+    int    tTrailHigh
+    int    tTrailLow
+    int    bias       = 0
+    int    lastBullOb = -1
+    int    lastBearOb = -1
+    Candle forming
+    bool   seenFirst  = false
+    bool   evBsl      = false
+    bool   evSsl      = false
+    PDArray evIfvgBear
+    PDArray evIfvgBull
+    PDArray evBrkBear
+    PDArray evBrkBull
+
+type Leg
+    int   dir
+    int   iSweep
+    int   tSweep
+    float ext
+    int   stage = 1          // 1 swept, 2 IFVG entry taken, 3 breaker entry taken
+
+type Trade
+    int    dir
+    string kind
+    int    iSig
+    int    tSweep
+    float  sweep
+    float  stop
+    float  entry
+    float  target
+    int    iFill
+    int    tFill
+    int    tExit
+    int    state = 0         // 0 pending, 1 open, 2 win, 3 loss, 4 cancelled
+    box    bRisk
+    box    bReward
+    label  lEntry
+    label  lSweep
+
+type Model
+    Leg   legS
+    Leg   legL
+    int   ctxS
+    int   ctxL
+    array<Trade> trades
+    int   signals = 0
+    int   wins    = 0
+    int   losses  = 0
+
+// ═══════════════════════════════════════════════════════════════════ global state
+var array<Engine> engines = array.new<Engine>()
+var Model         M       = Model.new(trades = array.new<Trade>())
+var array<int>    gId     = array.from(0)
+var array<string> logBuf  = array.new<string>()
+var array<int>    mStart  = array.new<int>()
+var array<int>    mEnd    = array.new<int>()
+var array<string> KSHORT  = array.from("LP", "RB", "OB", "FVG", "VI", "BB", "MB")
+var array<string> KNAME   = array.from("Liquidity Pool", "Rejection Block", "Order Block", "Fair Value Gap", "Volume Imbalance", "Breaker Block", "Mitigation Block")
+var array<string> SNAME   = array.from("Fresh", "Tested", "Filled", "Swept", "Run", "Invalidated", "Expired")
+var array<int>    PREM    = array.from(K_LP, K_RB, K_OB, K_FVG, K_VI, K_BB, K_MB)
+array<string>     alertBuf = array.new<string>()
+
+// ═══════════════════════════════════════════════════════════════════ helpers
+tfLabel(int s) =>
+    s < 60 ? str.tostring(s) + "s" : s < 3600 ? str.tostring(math.round(s / 60.0)) + "m" : s < 86400 ? str.tostring(math.round(s / 3600.0)) + "H" : s < 604800 ? str.tostring(math.round(s / 86400.0)) + "D" : s < 2419200 ? str.tostring(math.round(s / 604800.0)) + "W" : str.tostring(math.round(s / 2628003.0)) + "M"
+
+txtSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : size.normal
+
+tblPosition(string s) =>
+    s == "Top Right" ? position.top_right : s == "Middle Right" ? position.middle_right : s == "Bottom Right" ? position.bottom_right : s == "Top Left" ? position.top_left : s == "Middle Left" ? position.middle_left : position.bottom_left
+
+fmt(float p) =>
+    str.tostring(p, format.mintick)
+
+arrow(int d) =>
+    d == 1 ? "▲" : "▼"
+
+isLive(PDArray a) =>
+    a.state <= S_FILLED
+
+arrLabel(PDArray a) =>
+    a.kind == K_LP ? (a.dir == -1 ? "BSL" : "SSL") : a.kind == K_FVG and a.inverted ? "iFVG" : KSHORT.get(a.kind)
+
+kindOn(int k) =>
+    k == K_LP ? showLP : k == K_RB ? showRB : k == K_OB ? showOB : k == K_FVG ? showFVG : k == K_VI ? showVI : k == K_BB ? showBB : showMB
+
+stamp(Candle c) =>
+    str.format_time(c.tc, "MM-dd HH:mm", NY)
+
+pushLog(string s) =>
+    logBuf.push(s)
+    if logBuf.size() > math.max(logLen, 1)
+        logBuf.shift()
+
+// True when the bar [t0, t1) overlaps a macro window (New York time). Bars of a day or more always pass.
+inMacro(int t0, int t1) =>
+    bool ok = false
+    int dur = na(t1) ? 0 : math.floor((t1 - t0) / 60000.0)
+    if dur >= 1440
+        ok := true
+    else
+        int m0 = hour(t0, NY) * 60 + minute(t0, NY)
+        int sz = mStart.size()
+        if sz > 0
+            for k = 0 to sz - 1
+                if m0 < mEnd.get(k) and m0 + dur > mStart.get(k)
+                    ok := true
+    ok
+
+// ═══════════════════════════════════════════════════════════════════ PD array lifecycle
+// One closed candle of the array's own timeframe advances its state.
+method step(PDArray a, Candle c) =>
+    int tr = T_NONE
+    if a.kind == K_LP
+        if a.dir == -1
+            if c.h > a.top
+                a.state := c.c > a.top ? S_RUN : S_SWEPT
+                tr := c.c > a.top ? T_RUN : T_SWEPT
+        else
+            if c.l < a.bottom
+                a.state := c.c < a.bottom ? S_RUN : S_SWEPT
+                tr := c.c < a.bottom ? T_RUN : T_SWEPT
+    else
+        if a.kind == K_OB
+            if a.dir == 1
+                a.extreme := na(a.extreme) ? c.h : math.max(a.extreme, c.h)
+                if not na(a.liqRef) and a.extreme > a.liqRef
+                    a.tookLiq := true
+            else
+                a.extreme := na(a.extreme) ? c.l : math.min(a.extreme, c.l)
+                if not na(a.liqRef) and a.extreme < a.liqRef
+                    a.tookLiq := true
+        bool inside = a.dir == 1 ? c.l <= a.top : c.h >= a.bottom
+        bool brk    = a.dir == 1 ? c.c < a.bottom : c.c > a.top
+        bool thru   = a.dir == 1 ? c.l < a.bottom : c.h > a.top
+        bool ce     = a.dir == 1 ? c.l <= a.mid : c.h >= a.mid
+        if brk
+            a.state := S_INVALID
+            tr := T_INVALID
+        else
+            if inside
+                if not a.wasInside
+                    a.taps += 1
+                if ce
+                    a.ce := true
+                if (a.kind == K_FVG or a.kind == K_VI) and thru and a.state != S_FILLED
+                    a.state := S_FILLED
+                    tr := T_FILLED
+                else if a.state == S_FRESH
+                    a.state := S_TESTED
+                    tr := T_TESTED
+            a.wasInside := inside
+    tr
+
+// ═══════════════════════════════════════════════════════════════════ timeframe engine
+method cAt(Engine e, int idx) =>
+    int pos = e.candles.size() - e.n + idx
+    Candle res = na
+    if pos >= 0 and pos < e.candles.size()
+        res := e.candles.get(pos)
+    res
+
+method eqv(Engine e) =>
+    na(e.trailHigh) or na(e.trailLow) ? na : (e.trailHigh + e.trailLow) / 2
+
+method add(Engine e, int kind, int dir, float top, float bottom, float mid, int iOrigin, int tOrigin) =>
+    gId.set(0, gId.get(0) + 1)
+    PDArray a = PDArray.new(id = gId.get(0), kind = kind, dir = dir, top = top, bottom = bottom, mid = mid, iOrigin = iOrigin, tOrigin = tOrigin, iFormed = e.n - 1)
+    e.arrays.push(a)
+    a
+
+method describe(PDArray a, Engine e) =>
+    e.name + " " + arrow(a.dir) + arrLabel(a) + " " + (a.kind == K_LP ? fmt(a.top) : fmt(a.bottom) + "–" + fmt(a.top))
+
+method onFormed(Engine e, PDArray a) =>
+    if alFormed and (e.slot > 0 or alChart)
+        alertBuf.push("PD Matrix: new " + a.describe(e))
+
+method onTransition(Engine e, PDArray a, int t, Candle c) =>
+    if a.kind == K_LP and (t == T_SWEPT or t == T_RUN)
+        bool counts = t == T_SWEPT or sweepMode == "Any"
+        if a.dir == -1
+            e.evBsl := e.evBsl or counts
+        else
+            e.evSsl := e.evSsl or counts
+        if alSweep and (e.slot > 0 or alChart)
+            alertBuf.push("PD Matrix: " + a.describe(e) + (t == T_SWEPT ? " swept" : " run"))
+    if t != T_EXPIRED and (e.slot > 0 or logChart)
+        pushLog(stamp(c) + "  " + a.describe(e) + "  → " + SNAME.get(t))
+
+// Failed arrays flip polarity: FVG -> iFVG, OB -> Breaker (liquidity was taken) or Mitigation Block.
+method successor(Engine e, PDArray a, Candle c) =>
+    int kind = -1
+    bool inv = false
+    if a.kind == K_FVG and not a.inverted
+        kind := K_FVG
+        inv := true
+    else if a.kind == K_OB
+        kind := a.tookLiq ? K_BB : K_MB
+    if kind >= 0
+        PDArray ch = e.add(kind, -a.dir, a.top, a.bottom, a.mid, a.iOrigin, a.tOrigin)
+        ch.inverted := inv
+        ch.parentId := a.id
+        if inv
+            if ch.dir == -1 and na(e.evIfvgBear)
+                e.evIfvgBear := ch
+            if ch.dir == 1 and na(e.evIfvgBull)
+                e.evIfvgBull := ch
+        else if kind == K_BB or (mbAsBrk and kind == K_MB)
+            if ch.dir == -1 and na(e.evBrkBear)
+                e.evBrkBear := ch
+            if ch.dir == 1 and na(e.evBrkBull)
+                e.evBrkBull := ch
+        if e.slot > 0 or logChart
+            pushLog(stamp(c) + "  " + a.describe(e) + "  ⇒ " + arrow(ch.dir) + arrLabel(ch))
+        if alConv and (e.slot > 0 or alChart)
+            alertBuf.push("PD Matrix: " + a.describe(e) + " failed -> " + arrow(ch.dir) + arrLabel(ch))
+
+// Last opposite-close candle before a structure break / displacement.
+method orderBlock(Engine e, int d, int i) =>
+    PDArray res = na
+    int j = -1
+    int lo = math.max(0, i - obLookback)
+    if i - 1 >= lo
+        for k = i - 1 to lo
+            Candle ck = e.cAt(k)
+            if not na(ck)
+                if (d == 1 and ck.c < ck.o) or (d == -1 and ck.c > ck.o)
+                    j := k
+                    break
+    int last = d == 1 ? e.lastBullOb : e.lastBearOb
+    if j >= 0 and j > last
+        Candle cj = e.cAt(j)
+        float top = obZone == "Wick" ? cj.h : math.max(cj.o, cj.c)
+        float bot = obZone == "Wick" ? cj.l : math.min(cj.o, cj.c)
+        bool ok = true
+        float ext = na
+        for k = j + 1 to i
+            Candle ck = e.cAt(k)
+            if d == 1
+                ok := ok and ck.c >= bot
+                ext := na(ext) ? ck.h : math.max(ext, ck.h)
+            else
+                ok := ok and ck.c <= top
+                ext := na(ext) ? ck.l : math.min(ext, ck.l)
+        if ok
+            float ref = na
+            array<Swing> sw = d == 1 ? e.highs : e.lows
+            int ns = sw.size()
+            if ns > 0
+                for k = ns - 1 to 0
+                    Swing s = sw.get(k)
+                    if s.i < j
+                        ref := s.p
+                        break
+            if d == 1
+                e.lastBullOb := j
+            else
+                e.lastBearOb := j
+            res := e.add(K_OB, d, top, bot, (cj.o + cj.c) / 2, j, cj.t)
+            res.liqRef := ref
+            res.extreme := ext
+            res.tookLiq := not na(ref) and (d == 1 ? ext > ref : ext < ref)
+    res
+
+method findPool(Engine e, int d, float lvl, float tol) =>
+    PDArray best = na
+    for a in e.arrays
+        if a.kind == K_LP and a.dir == d and isLive(a) and math.abs(a.top - lvl) <= tol
+            if na(best) or math.abs(a.top - lvl) < math.abs(best.top - lvl)
+                best := a
+    best
+
+// Swing confirmation -> liquidity pools (equal highs/lows merge) and rejection blocks; resets the dealing range side.
+method swings(Engine e, int i) =>
+    int L = swingLen
+    if i >= 2 * L
+        int k = i - L
+        Candle ck = e.cAt(k)
+        bool ph = true
+        bool pl = true
+        for x = k - L to i
+            if x != k
+                Candle cx = e.cAt(x)
+                if x < k
+                    ph := ph and cx.h < ck.h
+                    pl := pl and cx.l > ck.l
+                else
+                    ph := ph and cx.h <= ck.h
+                    pl := pl and cx.l >= ck.l
+        float tol = eqTolAtr * e.atr
+        float rng = ck.h - ck.l
+        if ph
+            Swing sh = Swing.new(k, ck.t, ck.h)
+            e.highs.push(sh)
+            if e.highs.size() > MAXSW
+                e.highs.shift()
+            e.lastHigh := sh
+            e.trailHigh := ck.h
+            e.tTrailHigh := ck.t
+            PDArray pool = e.findPool(-1, ck.h, tol)
+            if not na(pool)
+                pool.touches += 1
+                float lv = math.max(pool.top, ck.h)
+                pool.top := lv
+                pool.bottom := lv
+                pool.mid := lv
+            else
+                PDArray lp = e.add(K_LP, -1, ck.h, ck.h, ck.h, k, ck.t)
+                e.onFormed(lp)
+            float bt = math.max(ck.o, ck.c)
+            if rng > 0 and (ck.h - bt) / rng >= rbWickPct
+                PDArray rb = e.add(K_RB, -1, ck.h, bt, (ck.h + bt) / 2, k, ck.t)
+                for x = k + 1 to i
+                    rb.step(e.cAt(x))
+                e.onFormed(rb)
+        if pl
+            Swing sl = Swing.new(k, ck.t, ck.l)
+            e.lows.push(sl)
+            if e.lows.size() > MAXSW
+                e.lows.shift()
+            e.lastLow := sl
+            e.trailLow := ck.l
+            e.tTrailLow := ck.t
+            PDArray pool = e.findPool(1, ck.l, tol)
+            if not na(pool)
+                pool.touches += 1
+                float lv = math.min(pool.bottom, ck.l)
+                pool.top := lv
+                pool.bottom := lv
+                pool.mid := lv
+            else
+                PDArray lp = e.add(K_LP, 1, ck.l, ck.l, ck.l, k, ck.t)
+                e.onFormed(lp)
+            float bb = math.min(ck.o, ck.c)
+            if rng > 0 and (bb - ck.l) / rng >= rbWickPct
+                PDArray rb = e.add(K_RB, 1, bb, ck.l, (bb + ck.l) / 2, k, ck.t)
+                for x = k + 1 to i
+                    rb.step(e.cAt(x))
+                e.onFormed(rb)
+
+method endAt(PDArray a, int i, Candle c) =>
+    a.iEnd := i
+    a.tEnd := c.tc
+
+// Process one CLOSED candle of this engine's timeframe (same order as pdmatrix/engine.py).
+method process(Engine e, Candle c) =>
+    e.candles.push(c)
+    if e.candles.size() > MAXC
+        e.candles.shift()
+    e.n += 1
+    int i = e.n - 1
+    e.evBsl := false
+    e.evSsl := false
+    e.evIfvgBear := na
+    e.evIfvgBull := na
+    e.evBrkBear := na
+    e.evBrkBull := na
+
+    // 1. ATR
+    Candle prev = e.cAt(i - 1)
+    float tr = na(prev) ? c.h - c.l : math.max(c.h - c.l, math.abs(c.h - prev.c), math.abs(c.l - prev.c))
+    e.atr := na(e.atr) ? tr : e.n <= atrLen ? (e.atr * (e.n - 1) + tr) / e.n : (e.atr * (atrLen - 1) + tr) / atrLen
+
+    // 2. lifecycle of everything already on the books (successors born here are not stepped)
+    int sz = e.arrays.size()
+    if sz > 0
+        for k = 0 to sz - 1
+            PDArray a = e.arrays.get(k)
+            if isLive(a)
+                int t = a.step(c)
+                if t == T_SWEPT or t == T_RUN or t == T_INVALID
+                    a.endAt(i, c)
+                if t != T_NONE
+                    e.onTransition(a, t, c)
+                if t == T_INVALID
+                    e.successor(a, c)
+                else if isLive(a) and i - a.iFormed > maxAge
+                    a.state := S_EXPIRED
+                    a.endAt(i, c)
+
+    // 3. structure
+    bool bosUp = false
+    bool bosDn = false
+    if not na(e.lastHigh)
+        Swing sh = e.lastHigh
+        if not sh.broken and c.c > sh.p
+            sh.broken := true
+            bosUp := true
+            e.bias := 1
+    if not na(e.lastLow)
+        Swing sl = e.lastLow
+        if not sl.broken and c.c < sl.p
+            sl.broken := true
+            bosDn := true
+            e.bias := -1
+
+    // 4. fair value gaps (3 candles) and volume imbalances (2 candles)
+    bool bullDisp = false
+    bool bearDisp = false
+    if i >= 2
+        Candle c0 = e.cAt(i - 2)
+        Candle c1 = e.cAt(i - 1)
+        bool big = math.abs(c1.c - c1.o) >= dispAtr * e.atr
+        if c.l > c0.h and c.l - c0.h >= fvgMinAtr * e.atr
+            e.onFormed(e.add(K_FVG, 1, c.l, c0.h, (c.l + c0.h) / 2, i - 1, c1.t))
+            bullDisp := big and c1.c > c1.o
+        if c.h < c0.l and c0.l - c.h >= fvgMinAtr * e.atr
+            e.onFormed(e.add(K_FVG, -1, c0.l, c.h, (c0.l + c.h) / 2, i - 1, c1.t))
+            bearDisp := big and c1.c < c1.o
+    if i >= 1
+        Candle p = e.cAt(i - 1)
+        float gapUp = math.min(c.o, c.c) - math.max(p.o, p.c)
+        if gapUp > 0 and gapUp >= viMinAtr * e.atr and (not viOverlap or c.l <= p.h)
+            e.onFormed(e.add(K_VI, 1, math.min(c.o, c.c), math.max(p.o, p.c), (math.min(c.o, c.c) + math.max(p.o, p.c)) / 2, i - 1, p.t))
+        float gapDn = math.min(p.o, p.c) - math.max(c.o, c.c)
+        if gapDn > 0 and gapDn >= viMinAtr * e.atr and (not viOverlap or c.h >= p.l)
+            e.onFormed(e.add(K_VI, -1, math.min(p.o, p.c), math.max(c.o, c.c), (math.min(p.o, p.c) + math.max(c.o, c.c)) / 2, i - 1, p.t))
+
+    // 5. order blocks
+    if bosUp or bullDisp
+        PDArray ob = e.orderBlock(1, i)
+        if not na(ob)
+            e.onFormed(ob)
+    if bosDn or bearDisp
+        PDArray ob = e.orderBlock(-1, i)
+        if not na(ob)
+            e.onFormed(ob)
+
+    // 6. dealing range (trailing extremes) + swings
+    if na(e.trailHigh)
+        e.trailHigh := c.h
+        e.tTrailHigh := c.t
+        e.trailLow := c.l
+        e.tTrailLow := c.t
+    if c.h > e.trailHigh
+        e.trailHigh := c.h
+        e.tTrailHigh := c.t
+    if c.l < e.trailLow
+        e.trailLow := c.l
+        e.tTrailLow := c.t
+    e.swings(i)
+
+    // 7. capacity: expire the oldest live arrays, then drop the oldest ended ones
+    int live = 0
+    int dead = 0
+    for a in e.arrays
+        if isLive(a)
+            live += 1
+        else
+            dead += 1
+    while live > maxLive
+        PDArray old = na
+        for a in e.arrays
+            if isLive(a)
+                if na(old) or a.iFormed < old.iFormed or (a.iFormed == old.iFormed and a.id < old.id)
+                    old := a
+        old.state := S_EXPIRED
+        old.endAt(i, c)
+        live -= 1
+        dead += 1
+    while dead > keepDead
+        int idx = -1
+        for [k, a] in e.arrays
+            if not isLive(a)
+                idx := k
+                break
+        PDArray r = e.arrays.remove(idx)
+        if not na(r.bx)
+            r.bx.delete()
+        dead -= 1
+
+method nearest(Engine e, int kind, int d, float px) =>
+    PDArray best = na
+    float bestD = na
+    float eq = e.eqv()
+    if not na(eq)
+        for a in e.arrays
+            if isLive(a) and a.kind == kind and a.dir == d and (d == -1 ? a.mid > eq : a.mid < eq)
+                float dist = px >= a.bottom and px <= a.top ? 0.0 : math.min(math.abs(px - a.top), math.abs(px - a.bottom))
+                if na(best) or dist < bestD
+                    best := a
+                    bestD := dist
+    best
+
+method nextUp(Engine e, float px) =>
+    PDArray best = na
+    for a in e.arrays
+        if isLive(a) and a.bottom > px
+            if na(best) or a.bottom < best.bottom or (a.bottom == best.bottom and a.id < best.id)
+                best := a
+    best
+
+method nextDown(Engine e, float px) =>
+    PDArray best = na
+    for a in e.arrays
+        if isLive(a) and a.top < px
+            if na(best) or a.top > best.top or (a.top == best.top and a.id < best.id)
+                best := a
+    best
+
+method paint(PDArray a, Engine e, int right) =>
+    bool  live   = isLive(a)
+    color base   = a.kind == K_LP ? lpCol : a.kind == K_BB or a.kind == K_MB ? brkCol : a.dir == 1 ? bullCol : bearCol
+    int   transp = not live ? 94 : a.state == S_FRESH ? 78 : a.state == S_TESTED ? 86 : 91
+    color fill   = a.kind == K_LP ? color.new(base, 100) : color.new(base, transp)
+    color border = color.new(base, live ? 30 : 75)
+    string style = a.kind == K_LP ? line.style_dotted : a.inverted or a.kind == K_BB or a.kind == K_MB ? line.style_dashed : line.style_solid
+    int   r      = live ? right : a.tEnd
+    string txt   = e.name + " " + arrow(a.dir) + arrLabel(a) + (a.kind == K_LP and a.touches > 1 ? " ×" + str.tostring(a.touches) : "") + (live ? "" : " · " + SNAME.get(a.state))
+    color tc     = color.new(base, live ? 0 : 55)
+    if na(a.bx)
+        a.bx := box.new(a.tOrigin, a.top, r, a.bottom, xloc = xloc.bar_time, border_color = border, border_width = 1, border_style = style, bgcolor = fill, text = txt, text_size = txtSize(boxTxt), text_color = tc, text_halign = text.align_right, text_valign = a.kind == K_LP ? (a.dir == -1 ? text.align_bottom : text.align_top) : text.align_center)
+    else
+        a.bx.set_left(a.tOrigin)
+        a.bx.set_right(r)
+        a.bx.set_top(a.top)
+        a.bx.set_bottom(a.bottom)
+        a.bx.set_bgcolor(fill)
+        a.bx.set_border_color(border)
+        a.bx.set_border_style(style)
+        a.bx.set_text(txt)
+        a.bx.set_text_color(tc)
+
+// ═══════════════════════════════════════════════════════════════════ One Setup for Life
+// Price in a live HTF premium (short) / discount (long) PD array.
+ctxHit(int d, Candle c) =>
+    bool hit = false
+    for eng in engines
+        if eng.slot > 0 and eng.valid and not hit
+            float eq = eng.eqv()
+            if not na(eq)
+                for a in eng.arrays
+                    if isLive(a) and a.dir == d and (d == -1 ? a.mid > eq : a.mid < eq) and c.h >= a.bottom and c.l <= a.top
+                        hit := true
+                        break
+    hit
+
+method signal(Model m, int d, string kind, int i, Candle c, Leg leg, PDArray z) =>
+    float stop = stopMode == "Beyond zone" ? (d == -1 ? z.top : z.bottom) : leg.ext
+    float buf = stopTicks * syminfo.mintick
+    stop := d == -1 ? stop + buf : stop - buf
+    m.trades.push(Trade.new(dir = d, kind = kind, iSig = i, tSweep = leg.tSweep, sweep = leg.ext, stop = stop))
+    m.signals += 1
+    if alSetup
+        alertBuf.push("PD Matrix: " + (d == -1 ? "SHORT" : "LONG") + (kind == "IFVG" ? " entry 1 (IFVG)" : " entry 2 (Breaker)") + " on " + tfLabel(timeframe.in_seconds()) + " — enter next open, stop " + fmt(stop) + ", target 1:" + str.tostring(rr))
+
+method manage(Model m, Candle c, int i, int right) =>
+    for t in m.trades
+        if t.state == 0
+            t.entry := c.o
+            t.iFill := i
+            t.tFill := c.t
+            float risk = (t.stop - c.o) * (-t.dir)
+            if risk <= 0
+                t.state := 4
+            else
+                t.target := c.o + t.dir * rr * risk
+                t.state := 1
+                t.bRisk := box.new(t.tFill, math.max(t.stop, t.entry), right, math.min(t.stop, t.entry), xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(bearCol, 82))
+                t.bReward := box.new(t.tFill, math.max(t.target, t.entry), right, math.min(t.target, t.entry), xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(bullCol, 82))
+                t.lEntry := label.new(t.tFill, t.entry, (t.dir == -1 ? "Short " : "Long ") + (t.kind == "IFVG" ? "② IFVG" : "③ Breaker"), xloc = xloc.bar_time, style = label.style_label_right, color = color.new(t.dir == -1 ? bearCol : bullCol, 10), textcolor = color.white, size = size.tiny)
+                t.lSweep := label.new(t.tSweep, t.sweep, "① sweep", xloc = xloc.bar_time, style = t.dir == -1 ? label.style_label_down : label.style_label_up, color = color.new(lpCol, 20), textcolor = color.white, size = size.tiny)
+    for t in m.trades
+        if t.state == 1
+            bool stopHit = t.dir == -1 ? c.h >= t.stop : c.l <= t.stop
+            bool tgtHit  = t.dir == -1 ? c.l <= t.target : c.h >= t.target
+            if stopHit or tgtHit
+                t.state := stopHit ? 3 : 2
+                t.tExit := c.tc
+                if stopHit
+                    m.losses += 1
+                else
+                    m.wins += 1
+                t.bRisk.set_right(c.tc)
+                t.bReward.set_right(c.tc)
+                t.lEntry.set_text(t.lEntry.get_text() + (stopHit ? " ✗" : " ✓"))
+    // keep the newest trades; drop the oldest finished ones first
+    while m.trades.size() > maxTrades
+        int idx = 0
+        for [k, t] in m.trades
+            if t.state != 1 and t.state != 0
+                idx := k
+                break
+        Trade r = m.trades.remove(idx)
+        if not na(r.bRisk)
+            r.bRisk.delete()
+            r.bReward.delete()
+            r.lEntry.delete()
+            r.lSweep.delete()
+
+method run(Model m, Engine ex, Candle c, int i, int right) =>
+    m.manage(c, i, right)
+    for d = -1 to 1 by 2
+        Leg leg = d == -1 ? m.legS : m.legL
+        if ctxHit(d, c)
+            if d == -1
+                m.ctxS := i
+            else
+                m.ctxL := i
+        if not na(leg)
+            if leg.stage >= 3 or i - leg.iSweep > setupBars
+                leg := na
+        bool swept = d == -1 ? ex.evBsl : ex.evSsl
+        int ctx = d == -1 ? m.ctxS : m.ctxL
+        if swept and not na(ctx)
+            if i - ctx <= ctxWindow and (na(leg) or leg.stage == 1)
+                leg := Leg.new(dir = d, iSweep = i, tSweep = c.t, ext = d == -1 ? c.h : c.l)
+        if not na(leg)
+            if leg.stage == 1
+                leg.ext := d == -1 ? math.max(leg.ext, c.h) : math.min(leg.ext, c.l)
+            PDArray ifvg = d == -1 ? ex.evIfvgBear : ex.evIfvgBull
+            PDArray brk  = d == -1 ? ex.evBrkBear : ex.evBrkBull
+            bool ok = not reqMacro or inMacro(c.t, c.tc)
+            if not na(ifvg) and leg.stage == 1 and ok
+                m.signal(d, "IFVG", i, c, leg, ifvg)
+                leg.stage := 2
+            if not na(brk) and (leg.stage == 1 or leg.stage == 2) and ok
+                m.signal(d, "Breaker", i, c, leg, brk)
+                leg.stage := 3
+        if d == -1
+            m.legS := leg
+        else
+            m.legL := leg
+
+legText(Leg leg, int d, int ctx, int i) =>
+    string side = d == -1 ? "▼ Short: " : "▲ Long: "
+    bool armed = not na(ctx) and i - ctx <= ctxWindow
+    na(leg) ? side + (armed ? "HTF " + (d == -1 ? "premium" : "discount") + " array touched → wait for sweep" : "wait for HTF " + (d == -1 ? "premium" : "discount") + " PD array") : leg.stage == 1 ? side + "① swept " + fmt(leg.ext) + " → wait IFVG / breaker" : leg.stage == 2 ? side + "② IFVG taken → wait breaker" : side + "③ breaker taken"
+
+// ═══════════════════════════════════════════════════════════════════ bootstrap
+int sC = timeframe.in_seconds(timeframe.period)
+int s1 = timeframe.in_seconds(tf1)
+int s2 = timeframe.in_seconds(tf2)
+int s3 = timeframe.in_seconds(tf3)
+int s4 = timeframe.in_seconds(tf4)
+int s5 = timeframe.in_seconds(tf5)
+
+if barstate.isfirst
+    for part in str.split(macroSpec, ",")
+        array<string> ab = str.split(str.replace_all(part, " ", ""), "-")
+        if ab.size() == 2
+            string a0 = ab.get(0)
+            string a1 = ab.get(1)
+            if str.length(a0) == 4 and str.length(a1) == 4
+                mStart.push(int(str.tonumber(str.substring(a0, 0, 2))) * 60 + int(str.tonumber(str.substring(a0, 2))))
+                mEnd.push(int(str.tonumber(str.substring(a1, 0, 2))) * 60 + int(str.tonumber(str.substring(a1, 2))))
+    engines.push(Engine.new(tf = timeframe.period, name = tfLabel(sC), secs = sC, slot = 0, valid = true, column = colChart, draw = drChart, candles = array.new<Candle>(), arrays = array.new<PDArray>(), highs = array.new<Swing>(), lows = array.new<Swing>()))
+    array<string> tfs = array.from(tf1, tf2, tf3, tf4, tf5)
+    array<int>    ss  = array.from(s1, s2, s3, s4, s5)
+    array<bool>   ons = array.from(on1, on2, on3, on4, on5)
+    array<bool>   drs = array.from(dr1, dr2, dr3, dr4, dr5)
+    array<int>    used = array.from(sC)
+    for k = 0 to 4
+        int s = ss.get(k)
+        bool ok = ons.get(k) and s > sC and not used.includes(s)
+        if ok
+            used.push(s)
+        engines.push(Engine.new(tf = tfs.get(k), name = tfLabel(s), secs = s, slot = k + 1, valid = ok, column = ok, draw = ok and drs.get(k), candles = array.new<Candle>(), arrays = array.new<PDArray>(), highs = array.new<Swing>(), lows = array.new<Swing>()))
+
+// ═══════════════════════════════════════════════════════════════════ per bar
+// timeframe.change() must run on every bar, so it is evaluated here, unconditionally.
+bool ch1 = timeframe.change(tf1)
+bool ch2 = timeframe.change(tf2)
+bool ch3 = timeframe.change(tf3)
+bool ch4 = timeframe.change(tf4)
+bool ch5 = timeframe.change(tf5)
+array<bool> chg = array.from(false, ch1, ch2, ch3, ch4, ch5)
+int barMs = sC * 1000
+int rightEdge = time + (extendBars + 1) * barMs
+
+// Higher timeframes: when a chart bar opens a new HTF period, the previous HTF candle is complete.
+// The first (possibly partial) HTF candle is discarded.
+for [s, eng] in engines
+    if s > 0 and eng.valid
+        if chg.get(s) and not na(eng.forming)
+            if eng.seenFirst
+                eng.process(eng.forming)
+            eng.seenFirst := true
+            eng.forming := na
+        if na(eng.forming)
+            eng.forming := Candle.new(time, time_close, open, high, low, close)
+        else
+            Candle f = eng.forming
+            f.h := math.max(f.h, high)
+            f.l := math.min(f.l, low)
+            f.c := close
+            f.tc := time_close
+
+// Chart (execution) timeframe: processed on bar close, then the setup model.
+Engine ce = engines.get(0)
+if barstate.isconfirmed
+    Candle cc = Candle.new(time, time_close, open, high, low, close)
+    ce.process(cc)
+    if setupOn
+        M.run(ce, cc, ce.n - 1, rightEdge)
+
+if alertBuf.size() > 0
+    alert(alertBuf.join("\n"), alert.freq_once_per_bar_close)
+
+bgcolor(shadeMacro and sC <= 900 and inMacro(time, time_close) ? color.new(macroCol, 92) : na, title = "Macro window")
+
+// ═══════════════════════════════════════════════════════════════════ drawing (last bar only)
+var box  pBox = na
+var box  dBox = na
+var line eqLn = na
+
+if barstate.islast
+    for eng in engines
+        if eng.valid
+            for a in eng.arrays
+                if drawOn and eng.draw and kindOn(a.kind) and (isLive(a) or showEnded)
+                    a.paint(eng, rightEdge)
+                else if not na(a.bx)
+                    a.bx.delete()
+                    a.bx := na
+    for t in M.trades
+        if t.state == 1
+            t.bRisk.set_right(rightEdge)
+            t.bReward.set_right(rightEdge)
+
+    int rs = rangeSel == "Chart" ? 0 : rangeSel == "TF 1" ? 1 : rangeSel == "TF 2" ? 2 : rangeSel == "TF 3" ? 3 : rangeSel == "TF 4" ? 4 : rangeSel == "TF 5" ? 5 : -1
+    box.delete(pBox)
+    box.delete(dBox)
+    line.delete(eqLn)
+    if rs >= 0
+        Engine re = engines.get(rs)
+        float eq = re.eqv()
+        if re.valid and not na(eq)
+            int left = math.min(re.tTrailHigh, re.tTrailLow)
+            pBox := box.new(left, re.trailHigh, rightEdge, eq, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(bearCol, 94), text = re.name + " Premium", text_size = txtSize(boxTxt), text_color = color.new(bearCol, 40), text_halign = text.align_left, text_valign = text.align_top)
+            dBox := box.new(left, eq, rightEdge, re.trailLow, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(bullCol, 94), text = re.name + " Discount", text_size = txtSize(boxTxt), text_color = color.new(bullCol, 40), text_halign = text.align_left, text_valign = text.align_bottom)
+            eqLn := line.new(left, eq, rightEdge, eq, xloc = xloc.bar_time, color = color.new(chart.fg_color, 50), style = line.style_dashed)
+
+// ═══════════════════════════════════════════════════════════════════ PD Array Matrix table
+var table mtx = table.new(tblPosition(tblPos), 7, 19, border_width = 1, border_color = color.new(chart.fg_color, 85), frame_width = 1, frame_color = color.new(chart.fg_color, 70))
+var table pnl = table.new(tblPosition(pnlPos), 1, 25, border_width = 0, frame_width = 1, frame_color = color.new(chart.fg_color, 70))
+
+glyph(int s) =>
+    s == S_FRESH ? "○" : s == S_TESTED ? "◐" : "●"
+
+cellTip(PDArray a, Engine e) =>
+    na(a) ? "" : a.describe(e) + "\n" + KNAME.get(a.kind) + (a.inverted ? " (inverted)" : "") + "\nState: " + SNAME.get(a.state) + " · taps " + str.tostring(a.taps) + (a.ce ? " · 50% reached" : "") + (a.kind == K_LP ? "\nTouches (equal highs/lows): " + str.tostring(a.touches) : "") + (a.kind == K_OB ? "\nLeg took liquidity: " + (a.tookLiq ? "yes → fails into Breaker" : "no → fails into Mitigation Block") : "") + "\nAge: " + str.tostring(e.n - 1 - a.iFormed) + " " + e.name + " candles"
+
+if barstate.islast and tblOn
+    float px = close
+    string ts = txtSize(tblTxt)
+    color fg = chart.fg_color
+    color bgHead = color.new(fg, 88)
+    color bgPrem = color.new(bearCol, 88)
+    color bgDisc = color.new(bullCol, 88)
+    table.cell(mtx, 0, 0, "PD Array Matrix", text_color = fg, text_size = ts, bgcolor = bgHead, text_halign = text.align_left)
+    table.cell(mtx, 0, 1, "Position in range", text_color = fg, text_size = ts, text_halign = text.align_left)
+    for r = 0 to 6
+        table.cell(mtx, 0, 2 + r, "P" + str.tostring(r + 1) + "  " + KNAME.get(PREM.get(r)), text_color = fg, text_size = ts, bgcolor = bgPrem, text_halign = text.align_left)
+        table.cell(mtx, 0, 10 + r, "D" + str.tostring(r + 1) + "  " + KNAME.get(PREM.get(6 - r)), text_color = fg, text_size = ts, bgcolor = bgDisc, text_halign = text.align_left)
+    table.cell(mtx, 0, 9, "EQ  Equilibrium", text_color = fg, text_size = ts, bgcolor = bgHead, text_halign = text.align_left)
+    table.cell(mtx, 0, 17, "Next ▲", text_color = fg, text_size = ts, text_halign = text.align_left)
+    table.cell(mtx, 0, 18, "Next ▼", text_color = fg, text_size = ts, text_halign = text.align_left)
+    int col = 1
+    for eng in engines
+        if eng.valid and eng.column
+            float eq = eng.eqv()
+            string bias = eng.bias == 1 ? " ▲" : eng.bias == -1 ? " ▼" : ""
+            table.cell(mtx, col, 0, eng.name + bias, text_color = fg, text_size = ts, bgcolor = bgHead, tooltip = str.tostring(eng.n) + " closed " + eng.name + " candles processed")
+            float span = na(eq) ? na : eng.trailHigh - eng.trailLow
+            float pos = na(span) or span <= 0 ? na : (px - eng.trailLow) / span
+            string posTxt = na(pos) ? "·" : (pos > 0.5 ? "P " : "D ") + str.tostring(math.round(pos * 100)) + "%"
+            table.cell(mtx, col, 1, posTxt, text_color = fg, text_size = ts, bgcolor = na(pos) ? na : pos > 0.5 ? bgPrem : bgDisc, tooltip = na(eq) ? "" : "Dealing range " + fmt(eng.trailLow) + " – " + fmt(eng.trailHigh))
+            for r = 0 to 6
+                PDArray ap = eng.nearest(PREM.get(r), -1, px)
+                PDArray ad = eng.nearest(PREM.get(6 - r), 1, px)
+                bool inP = not na(ap) and px >= ap.bottom and px <= ap.top
+                bool inD = not na(ad) and px >= ad.bottom and px <= ad.top
+                string tp = na(ap) ? "·" : (ap.kind == K_FVG and ap.inverted ? "i " : "") + fmt(ap.bottom) + " " + glyph(ap.state)
+                string td = na(ad) ? "·" : (ad.kind == K_FVG and ad.inverted ? "i " : "") + fmt(ad.top) + " " + glyph(ad.state)
+                table.cell(mtx, col, 2 + r, tp, text_color = fg, text_size = ts, bgcolor = inP ? color.new(bearCol, 55) : bgPrem, tooltip = cellTip(ap, eng))
+                table.cell(mtx, col, 10 + r, td, text_color = fg, text_size = ts, bgcolor = inD ? color.new(bullCol, 55) : bgDisc, tooltip = cellTip(ad, eng))
+            table.cell(mtx, col, 9, na(eq) ? "·" : fmt(eq), text_color = fg, text_size = ts, bgcolor = bgHead)
+            PDArray up = eng.nextUp(px)
+            PDArray dn = eng.nextDown(px)
+            table.cell(mtx, col, 17, na(up) ? "·" : arrLabel(up) + " " + fmt(up.bottom), text_color = fg, text_size = ts, tooltip = cellTip(up, eng))
+            table.cell(mtx, col, 18, na(dn) ? "·" : arrLabel(dn) + " " + fmt(dn.top), text_color = fg, text_size = ts, tooltip = cellTip(dn, eng))
+            col += 1
+
+if barstate.islast and pnlOn
+    string ts = txtSize(tblTxt)
+    color fg = chart.fg_color
+    int i = ce.n - 1
+    table.cell(pnl, 0, 0, "One Setup for Life · " + ce.name + (reqMacro ? " · macros " + (inMacro(time, time_close) ? "OPEN" : "closed") : ""), text_color = fg, text_size = ts, bgcolor = color.new(fg, 88), text_halign = text.align_left)
+    table.cell(pnl, 0, 1, setupOn ? legText(M.legS, -1, M.ctxS, i) : "model disabled", text_color = fg, text_size = ts, text_halign = text.align_left)
+    table.cell(pnl, 0, 2, setupOn ? legText(M.legL, 1, M.ctxL, i) : "", text_color = fg, text_size = ts, text_halign = text.align_left)
+    int closed = M.wins + M.losses
+    table.cell(pnl, 0, 3, "Signals " + str.tostring(M.signals) + " · " + str.tostring(M.wins) + "W / " + str.tostring(M.losses) + "L" + (closed > 0 ? " · " + str.tostring(math.round(100.0 * M.wins / closed)) + "% · net " + str.tostring(M.wins * rr - M.losses, "#.##") + "R" : ""), text_color = fg, text_size = ts, text_halign = text.align_left)
+    table.cell(pnl, 0, 4, logLen > 0 ? "Lifecycle log (New York time)" : "", text_color = fg, text_size = ts, bgcolor = logLen > 0 ? color.new(fg, 88) : na, text_halign = text.align_left)
+    int nl = logBuf.size()
+    for k = 0 to 19
+        string s = k < nl and k < logLen ? logBuf.get(nl - 1 - k) : ""
+        table.cell(pnl, 0, 5 + k, s, text_color = fg, text_size = ts, text_halign = text.align_left)
