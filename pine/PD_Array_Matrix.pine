@@ -716,6 +716,7 @@ method paint(PDArray a, Engine e, int right) =>
         a.bx.set_border_style(style)
         a.bx.set_text(txt)
         a.bx.set_text_color(tc)
+    a.bx
 
 // ═══════════════════════════════════════════════════════════════════ One Setup for Life
 // Price in a live HTF premium (short) / discount (long) PD array.
